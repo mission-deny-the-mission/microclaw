@@ -652,6 +652,8 @@ bot_username: "my_bot"
 # channels:
 #   telegram:
 #     default_account: "main"
+#     # optional: stream partial replies as they are generated (default: true)
+#     # streaming_enabled: true
 #     # optional: only allow these Telegram user IDs in private chats (DM)
 #     # allowed_user_ids: [123456789]
 #     accounts:

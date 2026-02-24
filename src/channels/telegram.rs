@@ -20,6 +20,9 @@ use microclaw_core::llm_types::{ContentBlock, ImageSource, MessageContent};
 use microclaw_core::text::floor_char_boundary;
 use microclaw_storage::db::{call_blocking, StoredMessage};
 
+const TELEGRAM_STREAM_FLUSH_CHARS: usize = 180;
+const TELEGRAM_STREAM_FLUSH_MS: u64 = 900;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelegramAccountConfig {
     pub bot_token: String,
@@ -31,11 +34,17 @@ pub struct TelegramAccountConfig {
     pub allowed_user_ids: Vec<i64>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub streaming_enabled: Option<bool>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 }
 
 fn default_enabled() -> bool {
+    true
+}
+
+fn default_telegram_streaming_enabled() -> bool {
     true
 }
 
@@ -51,6 +60,8 @@ pub struct TelegramChannelConfig {
     pub allowed_user_ids: Vec<i64>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default = "default_telegram_streaming_enabled")]
+    pub streaming_enabled: bool,
     #[serde(default)]
     pub accounts: HashMap<String, TelegramAccountConfig>,
     #[serde(default)]
@@ -201,6 +212,7 @@ pub struct TelegramRuntimeContext {
     pub allowed_groups: Vec<i64>,
     pub allowed_user_ids: Vec<i64>,
     pub model: Option<String>,
+    pub streaming_enabled: bool,
 }
 
 pub fn build_telegram_runtime_contexts(
@@ -272,6 +284,9 @@ pub fn build_telegram_runtime_contexts(
                     .filter(|v| !v.is_empty())
                     .map(ToOwned::to_owned)
             });
+        let streaming_enabled = account_cfg
+            .streaming_enabled
+            .unwrap_or(tg_cfg.streaming_enabled);
         runtimes.push((
             account_cfg.bot_token.clone(),
             TelegramRuntimeContext {
@@ -280,6 +295,7 @@ pub fn build_telegram_runtime_contexts(
                 allowed_groups,
                 allowed_user_ids,
                 model,
+                streaming_enabled,
             },
         ));
     }
@@ -302,6 +318,7 @@ pub fn build_telegram_runtime_contexts(
                     .map(str::trim)
                     .filter(|v| !v.is_empty())
                     .map(ToOwned::to_owned),
+                streaming_enabled: tg_cfg.streaming_enabled,
             },
         ));
     }
@@ -410,6 +427,7 @@ async fn handle_message(
     let tg_bot_username = tg_ctx.bot_username.clone();
     let tg_allowed_groups = tg_ctx.allowed_groups.clone();
     let tg_allowed_user_ids = tg_ctx.allowed_user_ids.clone();
+    let tg_streaming_enabled = tg_ctx.streaming_enabled;
     let sender_user_id = msg.from.as_ref().and_then(|u| i64::try_from(u.id.0).ok());
 
     // Security Check: Enforce allowlist for private chats early
@@ -788,7 +806,7 @@ async fn handle_message(
 
     // Process through platform-agnostic agent engine.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    match process_with_agent_with_events(
+    let process_fut = process_with_agent_with_events(
         &state,
         AgentRequestContext {
             caller_channel: &tg_channel_name,
@@ -798,20 +816,68 @@ async fn handle_message(
         None,
         image_data,
         Some(&event_tx),
-    )
-    .await
-    {
-        Ok(response) => {
-            typing_handle.abort();
-            drop(event_tx);
-            let mut used_send_message_tool = false;
-            while let Some(event) = event_rx.recv().await {
-                if let AgentEvent::ToolStart { name } = event {
-                    if name == "send_message" {
+    );
+    tokio::pin!(process_fut);
+
+    let mut used_send_message_tool = false;
+    let mut streamed_any = false;
+    let mut stream_pending = String::new();
+    let mut last_stream_flush = tokio::time::Instant::now();
+
+    let response = loop {
+        tokio::select! {
+            result = &mut process_fut => break result,
+            maybe_event = event_rx.recv() => {
+                let Some(event) = maybe_event else {
+                    continue;
+                };
+                match event {
+                    AgentEvent::ToolStart { name } if name == "send_message" => {
                         used_send_message_tool = true;
                     }
+                    AgentEvent::TextDelta { delta } => {
+                        if tg_streaming_enabled && !used_send_message_tool {
+                            stream_pending.push_str(&delta);
+                            let should_flush = stream_pending.len() >= TELEGRAM_STREAM_FLUSH_CHARS
+                                || last_stream_flush.elapsed() >= std::time::Duration::from_millis(TELEGRAM_STREAM_FLUSH_MS);
+                            if should_flush {
+                                if send_telegram_stream_chunk(&bot, msg.chat.id, &stream_pending, msg.thread_id).await {
+                                    streamed_any = true;
+                                }
+                                stream_pending.clear();
+                                last_stream_flush = tokio::time::Instant::now();
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
+        }
+    };
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            AgentEvent::ToolStart { name } if name == "send_message" => {
+                used_send_message_tool = true;
+            }
+            AgentEvent::TextDelta { delta } => {
+                if tg_streaming_enabled && !used_send_message_tool {
+                    stream_pending.push_str(&delta);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !used_send_message_tool
+        && !stream_pending.trim().is_empty()
+        && send_telegram_stream_chunk(&bot, msg.chat.id, &stream_pending, msg.thread_id).await
+    {
+        streamed_any = true;
+    }
+
+    match response {
+        Ok(response) => {
+            typing_handle.abort();
 
             if used_send_message_tool {
                 if !response.is_empty() {
@@ -826,7 +892,9 @@ async fn handle_message(
                     );
                 }
             } else if !response.is_empty() {
-                send_response(&bot, msg.chat.id, &response, msg.thread_id).await;
+                if !streamed_any {
+                    send_response(&bot, msg.chat.id, &response, msg.thread_id).await;
+                }
 
                 // Store bot response
                 let bot_msg = StoredMessage {
@@ -1149,6 +1217,30 @@ pub async fn send_response(
     for chunk in split_response_text(text) {
         send_telegram_markdown_or_plain(bot, chat_id, &chunk, message_thread_id).await;
     }
+}
+
+async fn send_telegram_stream_chunk(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    message_thread_id: Option<ThreadId>,
+) -> bool {
+    let content = text.trim();
+    if content.is_empty() {
+        return false;
+    }
+
+    let mut sent = false;
+    for chunk in split_response_text(content) {
+        let mut req = bot.send_message(chat_id, chunk);
+        if let Some(tid) = message_thread_id {
+            req = req.message_thread_id(tid);
+        }
+        if req.await.is_ok() {
+            sent = true;
+        }
+    }
+    sent
 }
 
 #[cfg(test)]

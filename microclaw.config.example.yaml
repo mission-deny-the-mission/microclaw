@@ -76,6 +76,8 @@ channels:
     enabled: false
     bot_token: ""
     bot_username: ""
+    # Stream partial model output as it is generated (default: true)
+    # streaming_enabled: true
     # Telegram group allowlist (empty = allow all groups)
     # allowed_groups: []
     # Telegram DM allowlist by sender user_id (empty = allow all users in private chats)
@@ -113,6 +115,8 @@ channels:
   #   homeserver_url: "https://matrix.org"
   #   access_token: "syt_xxx"
   #   bot_user_id: "@microclaw:matrix.org"
+  #   # Stream partial model output as it is generated (default: true)
+  #   # streaming_enabled: true
   #   # allowed_room_ids: ["!roomid:matrix.org"]
   #   # allowed_user_ids: ["@alice:matrix.org"]   # DM sender allowlist (empty = allow all DMs)
   #   # mention_required: true

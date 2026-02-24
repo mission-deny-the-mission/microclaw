@@ -34,6 +34,9 @@ use microclaw_core::text::split_text;
 use microclaw_storage::db::call_blocking;
 use microclaw_storage::db::StoredMessage;
 
+const MATRIX_STREAM_FLUSH_CHARS: usize = 220;
+const MATRIX_STREAM_FLUSH_MS: u64 = 1000;
+
 pub const SETUP_DEF: DynamicChannelDef = DynamicChannelDef {
     name: "matrix",
     presence_keys: &["homeserver_url", "access_token", "bot_user_id"],
@@ -66,10 +69,21 @@ pub const SETUP_DEF: DynamicChannelDef = DynamicChannelDef {
             secret: false,
             required: false,
         },
+        ChannelFieldDef {
+            yaml_key: "streaming_enabled",
+            label: "Stream partial replies (optional, default: true)",
+            default: "true",
+            secret: false,
+            required: false,
+        },
     ],
 };
 
 fn default_enabled() -> bool {
+    true
+}
+
+fn default_matrix_streaming_enabled() -> bool {
     true
 }
 
@@ -119,6 +133,8 @@ pub struct MatrixAccountConfig {
     pub sync_timeout_ms: u64,
     #[serde(default)]
     pub backup_key: String,
+    #[serde(default)]
+    pub streaming_enabled: Option<bool>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 }
@@ -143,6 +159,8 @@ pub struct MatrixChannelConfig {
     pub sync_timeout_ms: u64,
     #[serde(default)]
     pub backup_key: String,
+    #[serde(default = "default_matrix_streaming_enabled")]
+    pub streaming_enabled: bool,
     #[serde(default)]
     pub accounts: HashMap<String, MatrixAccountConfig>,
     #[serde(default)]
@@ -180,6 +198,7 @@ pub struct MatrixRuntimeContext {
     pub mention_required: bool,
     pub sync_timeout_ms: u64,
     pub backup_key: String,
+    pub streaming_enabled: bool,
     pub sdk_client: Option<Arc<RwLock<Option<Arc<MatrixSdkClient>>>>>,
 }
 
@@ -283,6 +302,9 @@ pub fn build_matrix_runtime_contexts(config: &crate::config::Config) -> Vec<Matr
         } else {
             account_cfg.bot_username.trim().to_string()
         };
+        let streaming_enabled = account_cfg
+            .streaming_enabled
+            .unwrap_or(matrix_cfg.streaming_enabled);
 
         runtimes.push(MatrixRuntimeContext {
             channel_name,
@@ -295,6 +317,7 @@ pub fn build_matrix_runtime_contexts(config: &crate::config::Config) -> Vec<Matr
             mention_required: account_cfg.mention_required,
             sync_timeout_ms: account_cfg.sync_timeout_ms,
             backup_key: account_cfg.backup_key.clone(),
+            streaming_enabled,
             sdk_client: None,
         });
     }
@@ -319,6 +342,7 @@ pub fn build_matrix_runtime_contexts(config: &crate::config::Config) -> Vec<Matr
             mention_required: matrix_cfg.mention_required,
             sync_timeout_ms: matrix_cfg.sync_timeout_ms,
             backup_key: matrix_cfg.backup_key,
+            streaming_enabled: matrix_cfg.streaming_enabled,
             sdk_client: None,
         });
     }
@@ -1783,8 +1807,8 @@ async fn handle_matrix_message(
     );
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-
-    match process_with_agent_with_events(
+    let matrix_streaming_enabled = runtime.streaming_enabled;
+    let process_fut = process_with_agent_with_events(
         &app_state,
         AgentRequestContext {
             caller_channel: &runtime.channel_name,
@@ -1794,20 +1818,68 @@ async fn handle_matrix_message(
         None,
         None,
         Some(&event_tx),
-    )
-    .await
-    {
-        Ok(response) => {
-            drop(event_tx);
-            let mut used_send_message_tool = false;
-            while let Some(event) = event_rx.recv().await {
-                if let AgentEvent::ToolStart { name } = event {
-                    if name == "send_message" {
+    );
+    tokio::pin!(process_fut);
+
+    let mut used_send_message_tool = false;
+    let mut streamed_any = false;
+    let mut stream_pending = String::new();
+    let mut last_stream_flush = tokio::time::Instant::now();
+
+    let response = loop {
+        tokio::select! {
+            result = &mut process_fut => break result,
+            maybe_event = event_rx.recv() => {
+                let Some(event) = maybe_event else {
+                    continue;
+                };
+                match event {
+                    AgentEvent::ToolStart { name } if name == "send_message" => {
                         used_send_message_tool = true;
                     }
+                    AgentEvent::TextDelta { delta } => {
+                        if matrix_streaming_enabled && !used_send_message_tool {
+                            stream_pending.push_str(&delta);
+                            let should_flush = stream_pending.len() >= MATRIX_STREAM_FLUSH_CHARS
+                                || last_stream_flush.elapsed() >= Duration::from_millis(MATRIX_STREAM_FLUSH_MS);
+                            if should_flush {
+                                if send_matrix_stream_chunk(&runtime, &msg.room_id, &stream_pending, msg.prefer_sdk_send).await {
+                                    streamed_any = true;
+                                }
+                                stream_pending.clear();
+                                last_stream_flush = tokio::time::Instant::now();
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
+        }
+    };
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            AgentEvent::ToolStart { name } if name == "send_message" => {
+                used_send_message_tool = true;
+            }
+            AgentEvent::TextDelta { delta } => {
+                if matrix_streaming_enabled && !used_send_message_tool {
+                    stream_pending.push_str(&delta);
+                }
+            }
+            _ => {}
+        }
+    }
 
+    if !used_send_message_tool
+        && !stream_pending.trim().is_empty()
+        && send_matrix_stream_chunk(&runtime, &msg.room_id, &stream_pending, msg.prefer_sdk_send)
+            .await
+    {
+        streamed_any = true;
+    }
+
+    match response {
+        Ok(response) => {
             if used_send_message_tool {
                 if !response.is_empty() {
                     info!(
@@ -1846,11 +1918,17 @@ async fn handle_matrix_message(
                     }
                 }
 
-                if let Err(e) =
-                    send_matrix_text_runtime(&runtime, &msg.room_id, &response, msg.prefer_sdk_send)
-                        .await
-                {
-                    error!("Matrix: failed to send response: {e}");
+                if !streamed_any {
+                    if let Err(e) = send_matrix_text_runtime(
+                        &runtime,
+                        &msg.room_id,
+                        &response,
+                        msg.prefer_sdk_send,
+                    )
+                    .await
+                    {
+                        error!("Matrix: failed to send response: {e}");
+                    }
                 }
 
                 let bot_msg = StoredMessage {
@@ -1893,6 +1971,21 @@ async fn handle_matrix_message(
             .await;
         }
     }
+}
+
+async fn send_matrix_stream_chunk(
+    runtime: &MatrixRuntimeContext,
+    room_id: &str,
+    text: &str,
+    prefer_sdk_send: bool,
+) -> bool {
+    let content = text.trim();
+    if content.is_empty() {
+        return false;
+    }
+    send_matrix_text_runtime(runtime, room_id, content, prefer_sdk_send)
+        .await
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -1962,6 +2055,7 @@ mod tests {
             mention_required: true,
             sync_timeout_ms: 30_000,
             backup_key: String::new(),
+            streaming_enabled: true,
             sdk_client: None,
         };
 
@@ -1983,6 +2077,7 @@ mod tests {
             mention_required: true,
             sync_timeout_ms: 30_000,
             backup_key: String::new(),
+            streaming_enabled: true,
             sdk_client: None,
         };
 
@@ -2003,6 +2098,7 @@ mod tests {
             mention_required: true,
             sync_timeout_ms: 30_000,
             backup_key: String::new(),
+            streaming_enabled: true,
             sdk_client: None,
         };
 
